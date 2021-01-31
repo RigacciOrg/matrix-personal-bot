@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Requires: python3-daemon python3-pil python3-aiofiles python3-aiohttp python3-magic
+"""
+
+import asyncio
+import daemon
+import daemon.pidfile
+import json
+import logging
+import magic
+import signal
+import os
+import sys
+import threading
+import time
+import aiofiles.os
+from aiohttp import ClientConnectionError, ServerDisconnectedError
+from nio import (
+    AsyncClient,
+    ClientConfig,
+    InviteEvent,
+    InviteNameEvent,
+    InviteMemberEvent,
+    LoginResponse,
+    MatrixRoom,
+    RoomMessageText,
+    SendRetryError,
+    SyncResponse,
+    UploadResponse
+)
+from nio.exceptions import LocalProtocolError
+from PIL import Image
+
+__author__ = "Niccolo Rigacci"
+__copyright__ = "Copyright 2020 Niccolo Rigacci <niccolo@rigacci.org>"
+__license__ = "GPLv3-or-later"
+__email__ = "niccolo@rigacci.org"
+__version__ = "0.0.1"
+
+HOMESERVER = "https://matrix.org"
+BOT_USER_ID = "@personal-bot:matrix.org"
+BOT_PASSWORD = "MySecret"
+STORE_PATH = "bot_store"
+COMMAND_PREFIX = "!"
+
+BE_DAEMON = False
+PID_FILE = 'matrix.pid'
+LOG_FILE = 'matrix-client.log'
+LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
+LOG_LEVEL = logging.DEBUG
+#LOG_LEVEL = logging.INFO
+RETRY_SEC = 15
+
+# See basic and advanced examples at:
+# https://matrix-nio.readthedocs.io/en/latest/examples.html
+
+# matrix-nio API doc:
+# https://matrix-nio.readthedocs.io/en/latest/nio.html
+
+# asyncio - Asynchronous I/O doc:
+# https://docs.python.org/3.7/library/asyncio.html
+
+class MyMatrixClient(AsyncClient):
+
+    def __init__(self, homeserver, user='', device_id='', store_path='', config=None, ssl=None, proxy=None):
+
+        # Call the __init__ method defined in AsyncClient.
+        super().__init__(homeserver, user=user, device_id=device_id, store_path=store_path, config=config, ssl=ssl, proxy=proxy)
+        # Flag to save an eventually received signals.
+        self.signal = None
+        # Handle the syncs with the server, fired by sync_forever(timeout=milliseconds).
+        self.add_response_callback(self.cb_sync, SyncResponse)
+        # Auto-join room invites.
+        self.add_event_callback(self.cb_autojoin_room, InviteEvent)
+        # Enable the callback for received messages.
+        self.add_event_callback(self.cb_handle_messages, RoomMessageText)
+        # Start listening to messages only afer the first sync().
+        self.listen_messages = False
+
+
+    class ClientException(Exception):
+        """ Custom exception raised to exif from sync_forever() """
+        pass
+
+
+    async def cb_sync(self, response):
+        """ Sync callback, called by sync_forever() on timeout """
+        logging.debug(f"Synced with homeserver, token: {response.next_batch}")
+        # React to signal received.
+        if self.signal is not None:
+            signum = self.signal
+            self.signal = None
+            raise self.ClientException(signum)
+        await self.cleanup()
+
+
+    async def cb_autojoin_room(self, room: MatrixRoom, event: InviteEvent):
+        """ Callback to automatically join a room on invite """
+        # Called three times when invited into a room:
+        #   1) InviteNameEvent: event.name = 'Room name'
+        #   2) InviteMemberEvent: event.content = {'membership': 'join', ...}
+        #      The join of room's owner.
+        #   3) InviteMemberEvent: event.content = {'membership': 'invite', ...}
+        #      The invite to ourself.
+        if type(event) == InviteNameEvent:
+            logging.debug(f'InviteNameEvent: event.name: "{event.name}"')
+        elif type(event) == InviteMemberEvent:
+            logging.debug('InviteMemberEvent: event.content: %s' % (event.content,))
+            if event.content['membership'] == 'invite':
+                logging.debug(f'Auto-joining room "{room.name}"')
+                await self.join(room.room_id)
+                logging.info(f'Joined room "{room.name}", encryption is: {room.encrypted}')
+                await self.send_text_to_room(room.room_id, "Hello, World!")
+
+
+    async def cb_handle_messages(self, room: MatrixRoom, event: RoomMessageText):
+        """ Callback to process received messages """
+        if not self.listen_messages:
+            return
+        logging.debug(f'Message in room "{room.display_name}" (encr:{event.decrypted}) from "{room.user_name(event.sender)}": {event.body}')
+        if event.body.startswith(COMMAND_PREFIX):
+            await self.parse_command(room, event)
+        elif event.sender != BOT_USER_ID:
+            await self.send_text_to_room(room.room_id, 'Message received')
+
+
+    async def cleanup(self):
+        """ Do periodic clean-up, e.g. leaving empty rooms """
+        logging.debug('Doing cleanup()')
+        for room_id in self.rooms:
+            room = self.rooms[room_id]
+            member_count = room.member_count
+            if member_count < 2:
+                logging.info('Leaving room %s, member_count: %s' % (room_id, room.member_count))
+                # FIXME If we forget(), a RuntimeError will be raised in sync_forever().
+                #await self.room_forget(room_id=room_id)
+                #logging.debug('Forgot room')
+                await self.room_leave(room_id=room_id)
+                logging.debug('Leaved room')
+
+
+    async def parse_command(self, room, event):
+        """ Parse commands received from room partecipants """
+        command = event.body[len(COMMAND_PREFIX):]
+        args = command.split()[1:]
+        if command.startswith("echo"):
+            response = " ".join(args)
+            await self.send_text_to_room(room.room_id, response)
+        if command.startswith("hup"):
+            logging.info('Received hup command, should restart client...')
+            raise self.ClientException(signal.SIGHUP)
+        if command.startswith("quit"):
+            logging.info('Received quit command, should exit...')
+            raise self.ClientException(signal.SIGQUIT)
+        if command.startswith("img"):
+            logging.info('Received img command, sending image...')
+            await self.send_image_to_room(room.room_id, 'image.jpg')
+        return
+
+
+    async def send_text_to_room(self, room_id, body):
+        """ Send a message into a room """
+        await self.room_send(
+            room_id=room_id,
+            message_type="m.room.message",
+            content={
+                "msgtype": "m.text",
+                "body": body
+            }
+        )
+
+
+    async def send_image_to_room(self, room_id, image):
+        """ Upload an image to server and send appropriate message into the room """
+        mime_type = magic.from_file(image, mime=True)
+        if not mime_type.startswith("image/"):
+            logging.error(f'Failed sending image "{image}", mime type is {mime_type}')
+            return
+        im = Image.open(image)
+        (width, height) = im.size
+        file_stat = await aiofiles.os.stat(image)
+        async with aiofiles.open(image, "r+b") as f:
+            resp, maybe_keys = await self.upload(
+                f,
+                content_type=mime_type,  # image/jpeg
+                filename=os.path.basename(image),
+                filesize=file_stat.st_size
+            )
+        if (isinstance(resp, UploadResponse)):
+            logging.debug(f'Image "{image}" was uploaded to server.')
+        else:
+            logging.error(f'Failed to upload image "{image}". Response: {resp}')
+            return
+        content = {
+            "body": os.path.basename(image),  # descriptive title
+            "info": {
+                "size": file_stat.st_size,
+                "mimetype": mime_type,
+                "thumbnail_info": None,
+                "w": width,
+                "h": height,
+                "thumbnail_url": None,
+            },
+            "msgtype": "m.image",
+            "url": resp.content_uri,
+        }
+        await self.room_send(
+            room_id,
+            message_type="m.room.message",
+            content=content
+        )
+        logging.info(f'Image "{image}" sent to room {room_id}')
+
+
+    def signal_handler(self, signum):
+        """ Callback executed on signal received """
+        # NOTE
+        # Cannot "async def" this handler: coroutines cannot be used with add_signal_handler().
+        # Cannot raise "ERROR Exception in callback" (this handler is a callback).
+        # Cannot use "await self.method()" because this handler is not "async def".
+        logging.info('Executing signal_handler(%s)' % (signum,))
+        if signum not in (signal.SIGUSR1, signal.SIGUSR2):
+            self.signal = signum
+
+
+    def save_login(self, resp):
+        with open('matrix.cfg', 'w') as f:
+            json.dump(
+                {
+                
+                    "homeserver": HOMESERVER,
+                    "user_id": resp.user_id,
+                    "device_id": resp.device_id,
+                    "access_token": resp.access_token
+                },
+                f
+            )
+
+
+async def main(loop):
+    if BE_DAEMON:
+        logging.basicConfig(format=LOG_FORMAT, level=LOG_LEVEL, filename=LOG_FILE)
+    else:
+        logging.basicConfig(format=LOG_FORMAT, level=LOG_LEVEL)
+    # If the store location doesn't exist, we'll make it
+    if STORE_PATH and not os.path.isdir(STORE_PATH):
+        os.mkdir(STORE_PATH)
+    # Create the client object and set the signal handlers.
+    client_cfg = ClientConfig(store_sync_tokens=True)
+    # TODO: If config file exists, re-use the saved token id.
+    client = MyMatrixClient(HOMESERVER, BOT_USER_ID, store_path=STORE_PATH, config=client_cfg)
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2):
+        loop.add_signal_handler(signum, client.signal_handler, signum)
+
+    # Login and sync messages forever. Repeat if something goes wrong.
+    do_login = True
+    while True:
+        if do_login:
+            try:
+                client.listen_messages = False
+                resp = await client.login(BOT_PASSWORD)
+                if isinstance(resp, LoginResponse):
+                    logging.info('Logged-in')
+                    client.save_login(resp)
+                else:
+                    logging.error(f'Failed to login: {resp}. Retrying in %s sec' % (RETRY_SEC,))
+                    time.sleep(RETRY_SEC)
+                    continue
+                # First sync() and announce in all the joined rooms that we are on-line again.
+                await client.sync(full_state=True)
+                my_joined = await client.joined_rooms()
+                logging.info('I am in rooms: %s' % (my_joined.rooms,))
+                for room_id in my_joined.rooms:
+                    logging.debug(f'Announcing myself in "{room_id}"')
+                    await client.send_text_to_room(room_id, "I'm on-line again")
+                do_login = False
+                client.listen_messages = True
+            except Exception as e:
+                logging.error('Unexpected Exception at login: %s' % (type(e),))
+                time.sleep(RETRY_SEC)
+                continue
+        try:
+            await client.sync_forever(timeout=5000, full_state=True) # milliseconds
+        except (SendRetryError):
+            logging.error('Unable to send message to homeserver')
+        except (ClientConnectionError, ServerDisconnectedError):
+            logging.error('Unable to connect to homeserver')
+            do_login = True
+        except client.ClientException as e:
+            logging.warning('ClientException: %s' % (str(e),))
+            if e.args[0] in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+                break  # Terminate the main loop.
+            elif e.args[0] in (signal.SIGHUP,):
+                do_login = True
+        except Exception as e:
+            logging.error('Unexpected Exception: %s' % (type(e),))
+            do_login = True
+
+        if do_login:
+            logging.info('Exception in sync_forever(): close client and retry in %s sec' % (RETRY_SEC,))
+            await client.close()
+            time.sleep(RETRY_SEC)
+
+
+if BE_DAEMON:
+    print('Running in background')
+    # TODO: Remove PID file if it exists and it is stale.
+    context = daemon.DaemonContext(
+        working_directory = '/tmp',
+        umask = 0o002,
+        pidfile = daemon.pidfile.PIDLockFile(PID_FILE),
+    )
+    with context:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main(loop))
+else:
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main(loop))
