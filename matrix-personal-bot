@@ -118,7 +118,6 @@ class MyMatrixClient(AsyncClient):
 
     async def cleanup(self):
         """ Do periodic clean-up, e.g. leaving empty rooms """
-        logging.debug('Doing cleanup()')
         # Don't trust self.rooms dictionary, it may contains already leaved rooms.
         my_joined = await self.joined_rooms()
         for room_id in my_joined.rooms:
@@ -258,51 +257,53 @@ async def main(loop):
         loop.add_signal_handler(signum, client.signal_handler, signum)
 
     # Login and sync messages forever. Repeat if something goes wrong.
-    do_login = True
+    logged_in = False
     while True:
-        if do_login:
+        if not logged_in:
             try:
                 client.listen_messages = False
                 resp = await client.login(cfg["BOT_PASSWORD"])
                 if isinstance(resp, LoginResponse):
                     logging.info('Logged-in')
                     client.save_login(resp)
+                    # Do a sync() and announce ourself in all the joined rooms.
+                    await client.sync(full_state=True)
+                    my_joined = await client.joined_rooms()
+                    logging.info('I am in rooms: %s' % (my_joined.rooms,))
+                    for room_id in my_joined.rooms:
+                        logging.debug(f'Announcing myself in "{room_id}"')
+                        await client.send_text_to_room(room_id, "I'm on-line again")
+                    client.listen_messages = True
+                    logged_in = True
                 else:
-                    logging.error(f'Failed to login: {resp}. Retrying in %s sec' % (cfg["RETRY_SEC"],))
-                    time.sleep(cfg["RETRY_SEC"])
-                    continue
-                # Do a sync() and announce ourself in all the joined rooms.
-                await client.sync(full_state=True)
-                my_joined = await client.joined_rooms()
-                logging.info('I am in rooms: %s' % (my_joined.rooms,))
-                for room_id in my_joined.rooms:
-                    logging.debug(f'Announcing myself in "{room_id}"')
-                    await client.send_text_to_room(room_id, "I'm on-line again")
-                do_login = False
-                client.listen_messages = True
+                    logging.error(f'Failed to login: {resp}')
             except Exception as e:
                 logging.error('Unexpected Exception at login: %s' % (type(e),))
-                time.sleep(cfg["RETRY_SEC"])
-                continue
-        try:
-            await client.sync_forever(timeout=cfg["MAIN_LOOP_INTERRUPT_MSEC"], full_state=True)
-        except (SendRetryError):
-            logging.error('Unable to send message to homeserver')
-        except (ClientConnectionError, ServerDisconnectedError):
-            logging.error('Unable to connect to homeserver')
-            do_login = True
-        except client.ClientException as e:
-            logging.warning('ClientException: %s' % (str(e),))
-            if e.args[0] in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
-                break  # Terminate the main loop.
-            elif e.args[0] in (signal.SIGHUP,):
-                do_login = True
-        except Exception as e:
-            logging.error('Unexpected Exception: %s' % (type(e),))
-            do_login = True
 
-        if do_login:
-            logging.info('Exception in sync_forever(): close client and retry in %s sec' % (cfg["RETRY_SEC"],))
+        if logged_in:
+            try:
+                await client.sync_forever(timeout=cfg["MAIN_LOOP_INTERRUPT_MSEC"], full_state=True)
+            except (SendRetryError):
+                logging.error('Unable to send message to homeserver')
+            except (ClientConnectionError, ServerDisconnectedError):
+                logging.error('Unable to connect to homeserver')
+                logged_in = False
+            except client.ClientException as e:
+                logging.warning('ClientException: %s' % (str(e),))
+                if e.args[0] in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+                    break  # Terminate the main loop.
+                elif e.args[0] in (signal.SIGHUP,):
+                    logged_in = False
+            except Exception as e:
+                logging.error('Unexpected Exception in sync_forever(): %s' % (type(e),))
+                logged_in = False
+
+        # Catch severe signals even if sync_forever() was not run.
+        if client.signal in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+            break  # Terminate the main loop.
+
+        if not logged_in:
+            logging.info('Close client and retry in %s sec' % (cfg["RETRY_SEC"],))
             await client.close()
             time.sleep(cfg["RETRY_SEC"])
 
