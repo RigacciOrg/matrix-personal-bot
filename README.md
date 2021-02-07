@@ -32,5 +32,5 @@ the **access\_token** granted by the homeserver after the
 assumes to be the only running instance of the bot; on program 
 exit it does a `client.logout(all_devices=True)`. If you intend 
 to run different instances of this bot, it is advised to use 
-different **BOT\_DEVICEID** in configuration file for each 
-instance, and you must set `client.logout(all\_devices=False)`.
+different `BOT_DEVICEID` in configuration file for each 
+instance, and you must set `client.logout(all_devices=False)`.
