@@ -20,18 +20,17 @@ datetime object. Get it from
 
 ## Session handling
 
-The **matrix-personal-bot** does not handle encryption at the 
+The matrix-personal-bot **does not handle encryption** at the 
 moment. Due this semplifcation we can skip entirely the use of 
 **storage classes** which are used to store encryption devices, 
 encryption keys and the trust state of devices.
 
 To keep the code as simple as possible, the bot does not save 
 the **access\_token** granted by the homeserver after the 
-**client.login()**. So the bot does a full login using **user** 
+`client.login()`. So the bot does a full login using **user**, 
 **device\_id** and **password** on each run. The program also 
 assumes to be the only running instance of the bot; on program 
-exit it does a **client.logout(all\_devices=True)**. If you 
-intend to run different instances of this bot, it is advised to 
-use different **BOT\_DEVICEID** in configuration file for each 
-instance, and you must set 
-**client.logout(all\_devices=False)**.
+exit it does a `client.logout(all_devices=True)`. If you intend 
+to run different instances of this bot, it is advised to use 
+different **BOT\_DEVICEID** in configuration file for each 
+instance, and you must set `client.logout(all\_devices=False)`.
