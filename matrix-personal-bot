@@ -122,7 +122,7 @@ class MyMatrixClient(AsyncClient):
 
 
     class ClientException(Exception):
-        """ Custom exception raised to exif from sync_forever() """
+        """ Custom exception raised to exit from sync_forever() """
         pass
 
 
