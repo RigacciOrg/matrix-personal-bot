@@ -135,9 +135,7 @@ class MyMatrixClient(AsyncClient):
                 await self.cmd_parser.process(self, None, 'sigusr')
                 self.signal = None
             else:
-                signum = self.signal
-                self.signal = None
-                raise self.ClientException(signum)
+                raise self.ClientException(self.signal)
         # Crontab execution.
         time_now = datetime.datetime.now()
         for job in self.crontab:
@@ -291,6 +289,7 @@ class MyMatrixClient(AsyncClient):
 
 def reload_config_file(running_cfg, config_file):
     """ Reload the configuration file """
+    cfg = running_cfg
     if os.path.isfile(config_file):
         logging.info(f'Reloading configuration file "{config_file}"')
         cfg = CONFIG_DEFAULTS
@@ -298,9 +297,10 @@ def reload_config_file(running_cfg, config_file):
             with open(config_file, 'r') as f:
                 cfg.update(json.load(f))
         except Exception as e:
-            logging.error(f'Config file error: %s' % (type(e),))
-            cfg = running_cfg
-        return cfg
+            logging.error(f'Config file error: %s' % (type(e).__name__,))
+    else:
+        logging.warning(f'Configuration file "{config_file}" is missing')
+    return cfg
 
 
 async def main(loop, cfg, config_file):
@@ -314,6 +314,7 @@ async def main(loop, cfg, config_file):
         log_handler = logging.StreamHandler(stream=sys.stdout)
     log_handler.setFormatter(logging.Formatter(cfg["LOG_FORMAT"]))
     logger.addHandler(log_handler)
+    logging.info('Starting Matrix personal bot')
     # Create the client object and set the signal handlers.
     client = MyMatrixClient(cfg["HOMESERVER"], user=cfg["BOT_USER_ID"],
         device_id=cfg["BOT_DEVICEID"])
@@ -323,15 +324,14 @@ async def main(loop, cfg, config_file):
     redo_login = True
     # Main loop: login and sync messages with homeserver, handle exceptions.
     while True:
+        # Clear the signal-received flag.
+        client.signal = None
         if not client.logged_in:
-            client.ignore_messages = True
-            # Parse crontabs from configuration file.
+            logging.info('Login to the homeserver')
             client.crontab = {}
-            for job in cfg["CRONTAB"]:
-                client.crontab[job] = Cronjob(cfg["CRONTAB"][job])
-            logging.info('Prepared crontab with %d jobs' % (len(client.crontab),))
-            # Try to login to homeserver.
+            client.ignore_messages = True
             try:
+                # Try to login to homeserver.
                 resp = await client.login(cfg["BOT_PASSWORD"])
                 if isinstance(resp, LoginResponse):
                     logging.info('Logged-in')
@@ -339,17 +339,24 @@ async def main(loop, cfg, config_file):
                 else:
                     logging.error(f'Failed to login: {resp}')
             except Exception as e:
-                logging.error('Unexpected Exception at login: %s' % (type(e),))
+                logging.error('Exception at login: %s' % (type(e).__name__,))
 
         if client.logged_in:
-            # Do the first sync() and announce ourself in all the joined rooms.
+            # Parse crontabs from configuration file.
+            try:
+                for job in cfg["CRONTAB"]:
+                    client.crontab[job] = Cronjob(cfg["CRONTAB"][job])
+            except Exception as e:
+                logging.error('Exception parsing crontab: %s' % (type(e).__name__,))
+            logging.info('Crontab contains %d jobs' % (len(client.crontab),))
+            # Do the first sync() and announce in all the joined rooms.
             try:
                 await client.sync(full_state=True)
                 my_joined = await client.joined_rooms()
                 logging.info('Sending hello in rooms: %s' % (my_joined.rooms,))
                 await client.send_text_broadcast("Hello! I'm on-line again.")
             except Exception as e:
-                logging.error('Exception in first sync and self-announce: %s' % (type(e),))
+                logging.error('Exception in first sync and self-announce: %s' % (type(e).__name__,))
             # Start the sync_forever(), which returns only for exceptions.
             client.ignore_messages = False
             try:
@@ -363,20 +370,17 @@ async def main(loop, cfg, config_file):
                 redo_login = True
             except client.ClientException as e:
                 logging.warning('ClientException: %s' % (str(e),))
-                if e.args[0] in (signal.SIGINT, signal.SIGQUIT,
-                        signal.SIGTERM):
-                    break  # Terminate the main loop.
-                elif e.args[0] in (signal.SIGHUP,):
-                    cfg = reload_config_file(cfg, config_file)
-                    logger.setLevel(getattr(logging, cfg["LOG_LEVEL"]))
-                    redo_login = True
             except Exception as e:
-                logging.error('Unexpected Exception in sync_forever(): %s' % (type(e),))
+                logging.error('Unexpected Exception in sync_forever(): %s' % (type(e).__name__,))
                 redo_login = True
 
-        # Catch severe signals even if sync_forever() was not run.
+        # Catch signals, even out of sync_forever() loop.
         if client.signal in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
             break  # Terminate the main loop.
+        elif client.signal in (signal.SIGHUP,):
+            cfg = reload_config_file(cfg, config_file)
+            logger.setLevel(getattr(logging, cfg["LOG_LEVEL"]))
+            redo_login = True
 
         if redo_login:
             logging.info('Close client and retry in %s sec' % (cfg["RETRY_SEC"],))
@@ -388,7 +392,7 @@ async def main(loop, cfg, config_file):
             time.sleep(cfg["RETRY_SEC"])
 
     # Main loop exit: terminate program.
-    logging.debug(f'Exiting main loop: client logout() and close()')
+    logging.info(f'Exiting main loop: client logout() and close()')
     if client.logged_in:
         try:
             await client.logout(all_devices=True)
