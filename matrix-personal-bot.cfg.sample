@@ -1,8 +1,8 @@
 {
     "HOMESERVER": "https://matrix.org",
     "BOT_USER_ID": "@test-bot:matrix.org",
+    "BOT_DEVICEID": "nio-host",
     "BOT_PASSWORD": "MySecret",
-    "STORE_PATH": "bot_store",
     "COMMAND_PREFIX": "!",
     "BE_DAEMON": true,
     "PID_FILE": "matrix-personal-bot.pid",
@@ -12,6 +12,6 @@
     "MAIN_LOOP_INTERRUPT_MSEC": 5000,
     "RETRY_SEC": 15,
     "CRONTAB": {
-        "cleanup": "* * * * *"
+        "cleanup": "* * * * */10"
     }
 }

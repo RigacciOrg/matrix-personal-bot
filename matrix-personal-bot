@@ -12,6 +12,7 @@ Module croniter requires:
 import bot_commands
 import croniter
 
+import aiofiles.os
 import asyncio
 import daemon
 import daemon.pidfile
@@ -19,23 +20,20 @@ import datetime
 import json
 import logging
 import magic
-import signal
 import os
+import signal
 import sys
 import threading
 import time
-import aiofiles.os
 from aiohttp import ClientConnectionError, ServerDisconnectedError
 from nio import (
     AsyncClient,
-    ClientConfig,
     InviteEvent,
     InviteNameEvent,
     InviteMemberEvent,
     LoginResponse,
     MatrixRoom,
     RoomForgetResponse,
-    RoomLeaveError,
     RoomLeaveResponse,
     RoomMessageText,
     SendRetryError,
@@ -57,8 +55,8 @@ CONFIG_FILE_DEFAULT = '/etc/matrix-personal-bo.cfg'
 CONFIG_DEFAULTS = {
     "HOMESERVER": "https://matrix.org",
     "BOT_USER_ID": "@test-bot:matrix.org",
+    "BOT_DEVICEID": "nio-host",
     "BOT_PASSWORD": "MySecret",
-    "STORE_PATH": "bot_store",
     "COMMAND_PREFIX": "!",
     "BE_DAEMON": True,
     "PID_FILE": 'matrix-personal-bot.pid',
@@ -66,7 +64,8 @@ CONFIG_DEFAULTS = {
     "LOG_FORMAT": '%(asctime)s %(levelname)s %(message)s',
     "LOG_LEVEL": 'DEBUG',
     "MAIN_LOOP_INTERRUPT_MSEC": 5000,
-    "RETRY_SEC": 15
+    "RETRY_SEC": 15,
+    "CRONTAB": { "cleanup": "* * * * */10" }
 }
 # MIME types accepted by send_file_to_room().
 ALLOWED_FILE_MIME = (
@@ -102,12 +101,12 @@ class Cronjob:
 
 class MyMatrixClient(AsyncClient):
 
-    def __init__(self, homeserver, user='', device_id='', store_path='',
-            config=None, ssl=None, proxy=None):
+    def __init__(self, homeserver, user='', device_id='', ssl=None,
+            proxy=None):
 
         # Call the __init__ method defined in AsyncClient.
         super().__init__(homeserver, user=user, device_id=device_id,
-            store_path=store_path, config=config, ssl=ssl, proxy=proxy)
+            ssl=ssl, proxy=proxy)
         # Flag to save an eventually received signals.
         self.signal = None
         # Handle the syncs with the server, fired by sync_forever(timeout).
@@ -290,19 +289,6 @@ class MyMatrixClient(AsyncClient):
         self.signal = signum
 
 
-    def save_login(self, resp):
-        with open('matrix.cfg', 'w') as f:
-            json.dump(
-                {
-                    "homeserver": cfg["HOMESERVER"],
-                    "user_id": resp.user_id,
-                    "device_id": resp.device_id,
-                    "access_token": resp.access_token
-                },
-                f
-            )
-
-
 def reload_config_file(running_cfg, config_file):
     """ Reload the configuration file """
     if os.path.isfile(config_file):
@@ -318,6 +304,7 @@ def reload_config_file(running_cfg, config_file):
 
 
 async def main(loop, cfg, config_file):
+    """ Initialize the Matrix bot and start the main loop """
     # Set the required logging.
     logger = logging.getLogger()
     logger.setLevel(getattr(logging, cfg["LOG_LEVEL"]))
@@ -327,50 +314,44 @@ async def main(loop, cfg, config_file):
         log_handler = logging.StreamHandler(stream=sys.stdout)
     log_handler.setFormatter(logging.Formatter(cfg["LOG_FORMAT"]))
     logger.addHandler(log_handler)
-    # If the store location doesn't exist, we'll make it
-    if cfg["STORE_PATH"] and not os.path.isdir(cfg["STORE_PATH"]):
-        os.mkdir(cfg["STORE_PATH"])
     # Create the client object and set the signal handlers.
-    client_cfg = ClientConfig(store_sync_tokens=True)
-    # TODO: If config.user_token exists, do client.load_store() instead of login().
-    #   * See https://github.com/anoadragon453/nio-template/blob/master/my_project_name/main.py
-    #   * But the store is empty. Why?
-    # TODO: Otherwise do we should use what was saved by save_login()?
-    client = MyMatrixClient(cfg["HOMESERVER"], cfg["BOT_USER_ID"],
-        store_path=cfg["STORE_PATH"], config=client_cfg)
+    client = MyMatrixClient(cfg["HOMESERVER"], user=cfg["BOT_USER_ID"],
+        device_id=cfg["BOT_DEVICEID"])
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT,
             signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2):
         loop.add_signal_handler(signum, client.signal_handler, signum)
-    logged_in = False
-    # Login and sync messages forever. Repeat if something goes wrong.
+    redo_login = True
+    # Main loop: login and sync messages with homeserver, handle exceptions.
     while True:
-        if not logged_in:
+        if not client.logged_in:
+            client.ignore_messages = True
             # Parse crontabs from configuration file.
             client.crontab = {}
             for job in cfg["CRONTAB"]:
                 client.crontab[job] = Cronjob(cfg["CRONTAB"][job])
             logging.info('Prepared crontab with %d jobs' % (len(client.crontab),))
+            # Try to login to homeserver.
             try:
-                client.ignore_messages = True
                 resp = await client.login(cfg["BOT_PASSWORD"])
                 if isinstance(resp, LoginResponse):
                     logging.info('Logged-in')
-                    client.save_login(resp)
-                    # Do a sync() and announce ourself in all the joined rooms.
-                    await client.sync(full_state=True)
-                    my_joined = await client.joined_rooms()
-                    logging.info('I am in rooms: %s' % (my_joined.rooms,))
-                    for room_id in my_joined.rooms:
-                        logging.debug(f'Announcing myself in "{room_id}"')
-                        await client.send_text_to_room(room_id, "I'm on-line again")
-                    client.ignore_messages = False
-                    logged_in = True
+                    redo_login = False
                 else:
                     logging.error(f'Failed to login: {resp}')
             except Exception as e:
                 logging.error('Unexpected Exception at login: %s' % (type(e),))
 
-        if logged_in:
+        if client.logged_in:
+            # Do the first sync() and announce ourself in all the joined rooms.
+            try:
+                await client.sync(full_state=True)
+                my_joined = await client.joined_rooms()
+                logging.info('Sending hello in rooms: %s' % (my_joined.rooms,))
+                await client.send_text_broadcast("Hello! I'm on-line again.")
+            except Exception as e:
+                logging.error('Exception in first sync and self-announce: %s' % (type(e),))
+            # Start the sync_forever(), which returns only for exceptions.
+            client.ignore_messages = False
             try:
                 await client.sync_forever(
                     timeout=cfg["MAIN_LOOP_INTERRUPT_MSEC"],
@@ -379,7 +360,7 @@ async def main(loop, cfg, config_file):
                 logging.error('Unable to send message to homeserver')
             except (ClientConnectionError, ServerDisconnectedError):
                 logging.error('Unable to connect to homeserver')
-                logged_in = False
+                redo_login = True
             except client.ClientException as e:
                 logging.warning('ClientException: %s' % (str(e),))
                 if e.args[0] in (signal.SIGINT, signal.SIGQUIT,
@@ -388,19 +369,35 @@ async def main(loop, cfg, config_file):
                 elif e.args[0] in (signal.SIGHUP,):
                     cfg = reload_config_file(cfg, config_file)
                     logger.setLevel(getattr(logging, cfg["LOG_LEVEL"]))
-                    logged_in = False
+                    redo_login = True
             except Exception as e:
                 logging.error('Unexpected Exception in sync_forever(): %s' % (type(e),))
-                logged_in = False
+                redo_login = True
 
         # Catch severe signals even if sync_forever() was not run.
         if client.signal in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
             break  # Terminate the main loop.
 
-        if not logged_in:
+        if redo_login:
             logging.info('Close client and retry in %s sec' % (cfg["RETRY_SEC"],))
-            await client.close()
+            try:
+                await client.logout(all_devices=True)
+                await client.close()
+            except:
+                pass
             time.sleep(cfg["RETRY_SEC"])
+
+    # Main loop exit: terminate program.
+    logging.debug(f'Exiting main loop: client logout() and close()')
+    if client.logged_in:
+        try:
+            await client.logout(all_devices=True)
+        except:
+            pass
+    try:
+        await client.close()
+    except:
+        pass
 
 
 if __name__ == '__main__':
